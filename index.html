@@ -286,6 +286,48 @@
   @media (max-width: 1024px) {
     button, .btn { min-height: 40px; }
   }
+
+  /* Custom range slider */
+  input[type="range"].slider-amber {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 8px;
+    background: linear-gradient(90deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0.12) 100%);
+    border-radius: 9999px;
+    outline: none;
+    cursor: pointer;
+  }
+  input[type="range"].slider-amber::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 22px;
+    height: 22px;
+    background: linear-gradient(135deg, #fbbf24, #f59e0b);
+    border-radius: 50%;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(251,191,36,0.5), 0 0 0 3px rgba(251,191,36,0.15);
+    transition: transform 0.15s;
+  }
+  input[type="range"].slider-amber::-webkit-slider-thumb:hover { transform: scale(1.1); }
+  input[type="range"].slider-amber::-webkit-slider-thumb:active { transform: scale(0.95); }
+  input[type="range"].slider-amber::-moz-range-thumb {
+    width: 22px;
+    height: 22px;
+    background: linear-gradient(135deg, #fbbf24, #f59e0b);
+    border-radius: 50%;
+    cursor: pointer;
+    border: none;
+    box-shadow: 0 2px 8px rgba(251,191,36,0.5);
+  }
+
+  /* Hide spinner on number inputs */
+  input[type="number"]::-webkit-outer-spin-button,
+  input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  input[type="number"] { -moz-appearance: textfield; }
 </style>
 </head>
 <body>
@@ -929,29 +971,53 @@ const TaskCard = ({ task, onStart, onComplete, onFail, onDelete, onEdit }) => {
 };
 
 // ── Task Modal ────────────────────────────────────────────────────────────────
+const fmtDur = (m) => {
+  m = Math.max(0, m | 0);
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60), mn = m % 60;
+  return mn ? `${h}h ${mn}m` : `${h}h`;
+};
+const complexityLabel = (c) =>
+  c <= 2 ? 'Trivial' : c <= 4 ? 'Routine' : c <= 6 ? 'Moderate' : c <= 8 ? 'Challenging' : 'Expert';
+
 const TaskModal = ({ task, onSave, onClose }) => {
   const [title, setTitle] = useState(task?.title || '');
   const [desc, setDesc] = useState(task?.description || '');
-  const [duration, setDuration] = useState(task?.duration || 60);
+  // Duration stored as STRING so the user can freely type/clear without snap-back
+  const [durationStr, setDurationStr] = useState(String(task?.duration || 60));
   const [complexity, setComplexity] = useState(task?.complexity || 3);
   const [start, setStart] = useState(fmtDTLocal(task?.scheduledStart || getNextSlot()));
   const [manualRank, setManualRank] = useState(task?.manualRank || '');
 
-  const rank = manualRank || calcRank(duration, complexity);
+  // Derive a numeric duration for the preview; doesn't force-update the input
+  const durationNum = (() => {
+    const n = parseInt(durationStr);
+    return isNaN(n) ? 0 : n;
+  })();
+  const previewDuration = Math.max(1, durationNum); // for rank calc only
+  const rank = manualRank || calcRank(previewDuration, complexity);
   const rewards = RANK_REWARDS[rank] || RANK_REWARDS.C;
+
+  const adjustDuration = (delta) => {
+    const cur = durationNum || 60;
+    setDurationStr(String(Math.max(5, cur + delta)));
+  };
+  const setPreset = (m) => setDurationStr(String(m));
 
   const handleSave = () => {
     if (!title.trim()) return;
+    const finalDuration = Math.max(5, durationNum || 60);
+    const finalComplexity = Math.min(10, Math.max(1, complexity || 1));
     const startISO = new Date(start).toISOString();
     onSave({
       id: task?.id || uuid(),
       title: title.trim(),
       description: desc.trim(),
-      duration: Number(duration),
-      complexity: Number(complexity),
+      duration: finalDuration,
+      complexity: finalComplexity,
       rank, manualRank,
       scheduledStart: startISO,
-      scheduledEnd: addMinutes(startISO, duration),
+      scheduledEnd: addMinutes(startISO, finalDuration),
       status: task?.status || 'pending',
       xpReward: rewards.xp,
       coinReward: rewards.coins,
@@ -961,6 +1027,9 @@ const TaskModal = ({ task, onSave, onClose }) => {
     });
   };
 
+  const presets = [15, 30, 45, 60, 90, 120, 180, 240];
+  const currentPreset = presets.find(p => p === durationNum);
+
   return (
     <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
       <div className="modal-content w-full max-w-md p-6 animate-scaleIn">
@@ -968,36 +1037,83 @@ const TaskModal = ({ task, onSave, onClose }) => {
           <h3 className="font-display text-xl">{task ? '✏️ Edit Task' : '✨ New Task'}</h3>
           <button onClick={onClose} className="btn btn-ghost btn-icon">✕</button>
         </div>
-        <div className="space-y-4">
+        <div className="space-y-5">
           <div>
             <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5 block">Title</label>
             <input className="input" value={title} onChange={e => setTitle(e.target.value)} placeholder="What needs to be done?" autoFocus />
           </div>
+
           <div>
             <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5 block">Notes (optional)</label>
             <input className="input" value={desc} onChange={e => setDesc(e.target.value)} placeholder="Additional details..." />
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5 block">Duration (min)</label>
-              <input className="input font-mono" type="number" min="5" value={duration} onChange={e => setDuration(Math.max(5, parseInt(e.target.value)||60))} />
+
+          {/* Duration with stepper + presets */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Duration</label>
+              <span className="text-amber-400 font-bold font-mono text-sm">{fmtDur(durationNum)}</span>
             </div>
-            <div>
-              <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5 block">Complexity (1–10)</label>
-              <input className="input font-mono" type="number" min="1" max="10" value={complexity} onChange={e => setComplexity(Math.min(10, Math.max(1, parseInt(e.target.value)||3)))} />
+            <div className="flex items-center gap-2 mb-2">
+              <button type="button" onClick={() => adjustDuration(-15)} className="btn btn-secondary shrink-0 font-mono w-12 h-11 p-0">−15</button>
+              <input
+                className="input font-mono text-center text-lg"
+                type="number"
+                inputMode="numeric"
+                value={durationStr}
+                onChange={e => setDurationStr(e.target.value.replace(/[^0-9]/g, ''))}
+                onBlur={() => { if (!durationStr || parseInt(durationStr) < 1) setDurationStr('5'); }}
+                placeholder="min"
+              />
+              <button type="button" onClick={() => adjustDuration(15)} className="btn btn-secondary shrink-0 font-mono w-12 h-11 p-0">+15</button>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {presets.map(m => (
+                <button
+                  key={m}
+                  type="button"
+                  className={`tab-pill text-[11px] ${currentPreset === m ? 'active' : ''}`}
+                  onClick={() => setPreset(m)}
+                >
+                  {fmtDur(m)}
+                </button>
+              ))}
             </div>
           </div>
+
+          {/* Complexity slider */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Complexity</label>
+              <span className="text-amber-400 font-bold font-mono text-sm">{complexity}/10 · <span className="text-amber-300/80">{complexityLabel(complexity)}</span></span>
+            </div>
+            <input
+              type="range"
+              min="1"
+              max="10"
+              step="1"
+              value={complexity}
+              onChange={e => setComplexity(parseInt(e.target.value))}
+              className="slider-amber"
+            />
+            <div className="flex justify-between text-[10px] text-gray-500 mt-1.5 font-mono">
+              <span>1</span><span>3</span><span>5</span><span>7</span><span>10</span>
+            </div>
+          </div>
+
           <div>
             <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5 block">Scheduled Start</label>
             <input className="input" type="datetime-local" value={start} onChange={e => setStart(e.target.value)} />
           </div>
+
           <div>
             <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5 block">Override Rank (optional)</label>
             <select className="input" value={manualRank} onChange={e => setManualRank(e.target.value)}>
-              <option value="">Auto → {calcRank(duration, complexity)}</option>
+              <option value="">Auto → {calcRank(previewDuration, complexity)}</option>
               {['E','D','C','B','A','S','SS','SSS'].map(r => <option key={r} value={r}>{r}</option>)}
             </select>
           </div>
+
           <div className="rounded-2xl p-4 bg-gradient-to-br from-amber-500/10 to-orange-500/5 border border-amber-500/20">
             <div className="text-[10px] font-bold text-amber-400 uppercase tracking-widest mb-2">Reward Preview</div>
             <div className="flex items-center justify-between">
@@ -1008,6 +1124,7 @@ const TaskModal = ({ task, onSave, onClose }) => {
               </div>
             </div>
           </div>
+
           <button className="btn btn-primary btn-lg w-full" onClick={handleSave} disabled={!title.trim()}>
             {task ? 'Save Changes' : 'Create Task'}
           </button>
