@@ -415,6 +415,26 @@ const isCalendarConnected = () => {
 
 const isGoogleConnected = isCalendarConnected;
 
+// Silent token refresh — works if user has an active Google session.
+// No popup, no consent screen — just a quiet token swap behind the scenes.
+const silentRefresh = () => new Promise((resolve) => {
+  if (!tokenClient) return resolve(false);
+  tokenClient.callback = (resp) => {
+    if (resp.error || !resp.access_token) return resolve(false);
+    try { localStorage.setItem('grind_gtoken', JSON.stringify({ token: resp.access_token, expires: Date.now() + (resp.expires_in*1000) })); } catch(e) {}
+    if (window.gapi?.client) window.gapi.client.setToken({ access_token: resp.access_token });
+    resolve(true);
+  };
+  try { tokenClient.requestAccessToken({ prompt: '' }); }
+  catch(e) { resolve(false); }
+});
+
+// Ensure we have a fresh token; refresh silently if not
+const ensureFreshToken = async () => {
+  if (isCalendarConnected()) return true;
+  return await silentRefresh();
+};
+
 const disconnectCalendar = () => {
   try {
     const t = JSON.parse(localStorage.getItem('grind_gtoken') || 'null');
@@ -943,6 +963,7 @@ const TaskCard = ({ task, onStart, onComplete, onFail, onDelete, onEdit }) => {
             <span>{task.duration}m</span>
             {!isToday(task.scheduledStart) && <><span className="text-gray-600">·</span><span className="text-purple-400">{fmtDate(task.scheduledStart)}</span></>}
             {task.calendarEventId && <><span className="text-gray-600">·</span><span title="Synced to Google Calendar" className="text-blue-400">📅</span></>}
+            {!task.calendarEventId && task.pendingCalendarSync && <><span className="text-gray-600">·</span><span title="Will sync to calendar when online" className="text-amber-400">⏳</span></>}
           </div>
           {task.description && <p className="text-[12px] text-gray-500 mt-1.5 truncate">{task.description}</p>}
         </div>
@@ -2154,15 +2175,77 @@ const App = () => {
     return () => { cancelled = true; };
   }, []);
 
-  // Re-check calendar connection periodically
+  // Re-check calendar connection periodically + proactively refresh token before expiry
   useEffect(() => {
-    const id = setInterval(() => {
+    const check = async () => {
+      try {
+        const t = JSON.parse(localStorage.getItem('grind_gtoken') || 'null');
+        if (t?.token) {
+          const msLeft = t.expires - Date.now();
+          // Refresh silently if less than 5 minutes left
+          if (msLeft > 0 && msLeft < 5 * 60 * 1000) {
+            await silentRefresh();
+          }
+        }
+      } catch(e) {}
       const c = isCalendarConnected();
       setCalConnected(c);
       if (!c) setSyncStatus('offline');
-    }, 30000);
+    };
+    const id = setInterval(check, 60000);
     return () => clearInterval(id);
   }, []);
+
+  // Background retry loop: silently sync any tasks with pendingCalendarSync flag
+  useEffect(() => {
+    let stopped = false;
+    const retryPending = async () => {
+      if (stopped) return;
+      if (!settings.calendarSync) return;
+      // Read fresh state from localStorage so this isn't tied to React state closures
+      let currentTasks;
+      try {
+        currentTasks = JSON.parse(localStorage.getItem('grind_tasks') || '{"tasks":[]}').tasks || [];
+      } catch(e) { return; }
+      const pending = currentTasks.filter(t =>
+        t.pendingCalendarSync && !t.calendarEventId && t.status === 'pending'
+      );
+      if (!pending.length) return;
+
+      const ok = await ensureFreshToken();
+      if (!ok) return;
+      if (!stopped) setCalConnected(true);
+
+      let synced = 0;
+      let finalTasks = [...currentTasks];
+      for (const t of pending) {
+        const evId = await createCalEvent(t);
+        if (evId) {
+          synced++;
+          finalTasks = finalTasks.map(x =>
+            x.id === t.id ? { ...x, calendarEventId: evId, pendingCalendarSync: false } : x
+          );
+        }
+      }
+      if (synced > 0 && !stopped) {
+        setTasks(finalTasks);
+        await save('tasks', { tasks: finalTasks });
+        showToast(`${synced} task${synced > 1 ? 's' : ''} synced to calendar 📅`, 'success', '☁️');
+      }
+    };
+    // Try shortly after mount, then every 90s
+    const initial = setTimeout(retryPending, 6000);
+    const id = setInterval(retryPending, 90000);
+    // Also try when the tab regains focus (user returning to app)
+    const onFocus = () => retryPending();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      stopped = true;
+      clearTimeout(initial);
+      clearInterval(id);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [settings.calendarSync, showToast]);
 
   // Daily reset
   useEffect(() => {
@@ -2240,37 +2323,44 @@ const App = () => {
 
   const handleSaveTask = useCallback(async (task) => {
     const isNew = !editingTask;
-    const newTasks = isNew ? [...tasks, task] : tasks.map(t => t.id === task.id ? task : t);
+    // Mark as pending calendar sync if sync is on; cleared when sync succeeds
+    const taskWithFlag = settings.calendarSync && isNew ? { ...task, pendingCalendarSync: true } : task;
+    const newTasks = isNew ? [...tasks, taskWithFlag] : tasks.map(t => t.id === task.id ? task : t);
     setTasks(newTasks);
     setShowTaskModal(false);
     setEditingTask(null);
     await save('tasks', { tasks: newTasks });
 
-    // Calendar sync — with visible feedback
-    const wantsCalSync = settings.calendarSync;
-    const tokenLive = isCalendarConnected();
-    if (wantsCalSync && tokenLive) {
-      if (isNew && !task.calendarEventId) {
-        const evId = await createCalEvent(task);
-        if (evId) {
-          const finalTasks = newTasks.map(t => t.id === task.id ? { ...t, calendarEventId: evId } : t);
-          setTasks(finalTasks);
-          await save('tasks', { tasks: finalTasks });
-          showToast('Task saved · added to calendar 📅', 'success', '✅');
-        } else {
-          showToast('Task saved · calendar failed (try reconnecting)', 'warning', '⚠️');
-        }
-      } else if (!isNew && task.calendarEventId) {
-        const ok = await updateCalEvent(task.calendarEventId, task);
-        showToast(ok ? 'Task updated · calendar updated' : 'Task updated · calendar update failed', ok ? 'success' : 'warning', ok ? '✅' : '⚠️');
-      } else {
-        showToast(isNew ? 'Task created' : 'Task updated', 'success', '📋');
-      }
-    } else if (wantsCalSync && !tokenLive) {
-      showToast('Task saved · Google session expired — reconnect in Settings', 'warning', '⚠️');
-      setCalConnected(false);
-    } else {
+    if (!settings.calendarSync) {
       showToast(isNew ? `Task created · +${task.xpReward} XP on completion` : 'Task updated', 'success', '📋');
+      return;
+    }
+
+    // Try silent refresh if token is stale
+    const ok = await ensureFreshToken();
+    if (ok) setCalConnected(true);
+
+    if (!ok) {
+      // No token, can't sync now — leave the pending flag, retry loop will catch up
+      showToast(isNew ? 'Task saved · will sync to calendar when online ⏳' : 'Task updated locally · sync pending', 'info', '⏳');
+      return;
+    }
+
+    if (isNew && !task.calendarEventId) {
+      const evId = await createCalEvent(task);
+      if (evId) {
+        const finalTasks = newTasks.map(t => t.id === task.id ? { ...t, calendarEventId: evId, pendingCalendarSync: false } : t);
+        setTasks(finalTasks);
+        await save('tasks', { tasks: finalTasks });
+        showToast('Task saved · added to calendar 📅', 'success', '✅');
+      } else {
+        showToast('Task saved · will retry calendar sync ⏳', 'info', '⏳');
+      }
+    } else if (!isNew && task.calendarEventId) {
+      const updateOk = await updateCalEvent(task.calendarEventId, task);
+      showToast(updateOk ? 'Task updated · calendar updated 📅' : 'Task updated · calendar sync pending', updateOk ? 'success' : 'info', updateOk ? '✅' : '⏳');
+    } else {
+      showToast(isNew ? 'Task created' : 'Task updated', 'success', '📋');
     }
   }, [tasks, editingTask, settings.calendarSync, showToast]);
 
