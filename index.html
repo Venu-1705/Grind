@@ -2245,20 +2245,34 @@ const App = () => {
     setShowTaskModal(false);
     setEditingTask(null);
     await save('tasks', { tasks: newTasks });
-    if (settings.calendarSync && calConnected) {
+
+    // Calendar sync — with visible feedback
+    const wantsCalSync = settings.calendarSync;
+    const tokenLive = isCalendarConnected();
+    if (wantsCalSync && tokenLive) {
       if (isNew && !task.calendarEventId) {
         const evId = await createCalEvent(task);
         if (evId) {
           const finalTasks = newTasks.map(t => t.id === task.id ? { ...t, calendarEventId: evId } : t);
           setTasks(finalTasks);
           await save('tasks', { tasks: finalTasks });
+          showToast('Task saved · added to calendar 📅', 'success', '✅');
+        } else {
+          showToast('Task saved · calendar failed (try reconnecting)', 'warning', '⚠️');
         }
       } else if (!isNew && task.calendarEventId) {
-        updateCalEvent(task.calendarEventId, task);
+        const ok = await updateCalEvent(task.calendarEventId, task);
+        showToast(ok ? 'Task updated · calendar updated' : 'Task updated · calendar update failed', ok ? 'success' : 'warning', ok ? '✅' : '⚠️');
+      } else {
+        showToast(isNew ? 'Task created' : 'Task updated', 'success', '📋');
       }
+    } else if (wantsCalSync && !tokenLive) {
+      showToast('Task saved · Google session expired — reconnect in Settings', 'warning', '⚠️');
+      setCalConnected(false);
+    } else {
+      showToast(isNew ? `Task created · +${task.xpReward} XP on completion` : 'Task updated', 'success', '📋');
     }
-    showToast(isNew ? `Task created · +${task.xpReward} XP on completion` : 'Task updated', 'success', '📋');
-  }, [tasks, editingTask, settings.calendarSync, calConnected, showToast]);
+  }, [tasks, editingTask, settings.calendarSync, showToast]);
 
   const handleStartTask = useCallback(async (id) => {
     const newTasks = tasks.map(t => t.id === id ? { ...t, status: 'in_progress' } : t);
