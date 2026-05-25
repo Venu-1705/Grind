@@ -744,6 +744,88 @@ const defaultProfile = () => ({
 const defaultInventory = () => ({ permanentItems: [], consumables: [], activeBuffs: [], rewardTickets: [] });
 const defaultSettings = () => ({ workingHours: {start:'09:00',end:'18:00'}, timezone:'Asia/Kolkata', penaltyDifficulty:'harsh', calendarSync:false, dailyReminderTime:'22:00' });
 
+// ── Recurring tasks ───────────────────────────────────────────────────────────
+const WEEKDAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const recurrenceMatches = (tmpl, date) => {
+  const day = date.getDay();
+  switch (tmpl.recurrenceType) {
+    case 'daily':    return true;
+    case 'weekdays': return day >= 1 && day <= 5;
+    case 'weekends': return day === 0 || day === 6;
+    case 'weekly':   return day === (tmpl.weekday ?? 1);
+    default: return false;
+  }
+};
+
+const describeRecurrence = (tmpl) => {
+  if (!tmpl) return '';
+  switch (tmpl.recurrenceType) {
+    case 'daily':    return 'Every day';
+    case 'weekdays': return 'Weekdays (Mon–Fri)';
+    case 'weekends': return 'Weekends (Sat–Sun)';
+    case 'weekly':   return `Every ${WEEKDAYS[tmpl.weekday ?? 1]}`;
+    default: return '';
+  }
+};
+
+// Generate any missing instances from `tmpl.lastGenerated` up through today
+const generateRecurringInstances = (recurringTasks, existingTasks) => {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const todayKey = today.toISOString().split('T')[0];
+
+  let updatedTasks = [...existingTasks];
+  let updatedRecurring = recurringTasks.map(tmpl => ({ ...tmpl }));
+  let createdCount = 0;
+
+  for (const tmpl of updatedRecurring) {
+    if (!tmpl.active) continue;
+    const startBase = tmpl.lastGenerated || (tmpl.createdAt || '').split('T')[0];
+    if (!startBase) continue;
+    const cursor = new Date(startBase + 'T00:00:00');
+    cursor.setDate(cursor.getDate() + 1); // day after last generation
+
+    while (cursor <= today) {
+      if (recurrenceMatches(tmpl, cursor)) {
+        const dateKey = cursor.toISOString().split('T')[0];
+        const alreadyExists = updatedTasks.some(t =>
+          t.parentRecurringId === tmpl.id && t.scheduledStart.startsWith(dateKey)
+        );
+        if (!alreadyExists) {
+          const start = new Date(cursor);
+          start.setHours(tmpl.hour || 9, tmpl.minute || 0, 0, 0);
+          const end = new Date(start.getTime() + (tmpl.duration || 60) * 60000);
+          const rank = tmpl.manualRank || calcRank(tmpl.duration || 60, tmpl.complexity || 3);
+          const rewards = RANK_REWARDS[rank] || RANK_REWARDS.C;
+          updatedTasks.push({
+            id: uuid(),
+            title: tmpl.title,
+            description: tmpl.description || '',
+            duration: tmpl.duration || 60,
+            complexity: tmpl.complexity || 3,
+            rank,
+            manualRank: tmpl.manualRank || '',
+            scheduledStart: start.toISOString(),
+            scheduledEnd: end.toISOString(),
+            status: 'pending',
+            xpReward: rewards.xp,
+            coinReward: rewards.coins,
+            statGains: rewards.stats,
+            parentRecurringId: tmpl.id,
+            calendarEventId: null,
+            pendingCalendarSync: true,   // retry loop will catch this up if sync is on
+            createdAt: new Date().toISOString()
+          });
+          createdCount++;
+        }
+      }
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    tmpl.lastGenerated = todayKey;
+  }
+
+  return { updatedTasks, updatedRecurring, createdCount };
+};
+
 // ── Google Calendar Operations ────────────────────────────────────────────────
 const CAL_COLORS = { E:'8', D:'2', C:'7', B:'3', A:'5', S:'11', SS:'4', SSS:'9' };
 
@@ -964,6 +1046,7 @@ const TaskCard = ({ task, onStart, onComplete, onFail, onDelete, onEdit }) => {
             {!isToday(task.scheduledStart) && <><span className="text-gray-600">·</span><span className="text-purple-400">{fmtDate(task.scheduledStart)}</span></>}
             {task.calendarEventId && <><span className="text-gray-600">·</span><span title="Synced to Google Calendar" className="text-blue-400">📅</span></>}
             {!task.calendarEventId && task.pendingCalendarSync && <><span className="text-gray-600">·</span><span title="Will sync to calendar when online" className="text-amber-400">⏳</span></>}
+            {task.parentRecurringId && <><span className="text-gray-600">·</span><span title="Repeating task" className="text-purple-400">🔁</span></>}
           </div>
           {task.description && <p className="text-[12px] text-gray-500 mt-1.5 truncate">{task.description}</p>}
         </div>
@@ -1009,6 +1092,9 @@ const TaskModal = ({ task, onSave, onClose }) => {
   const [complexityStr, setComplexityStr] = useState(String(task?.complexity || 3));
   const [start, setStart] = useState(fmtDTLocal(task?.scheduledStart || getNextSlot()));
   const [manualRank, setManualRank] = useState(task?.manualRank || '');
+  // Repeat — only for new tasks (instances of an existing repeat are edited as one-offs)
+  const [repeat, setRepeat] = useState('none');
+  const isEditing = !!task;
 
   // Derive numeric values for preview/calculations (don't force-update the inputs)
   const durationNum = (() => { const n = parseInt(durationStr); return isNaN(n) ? 0 : n; })();
@@ -1038,7 +1124,7 @@ const TaskModal = ({ task, onSave, onClose }) => {
       statGains: rewards.stats,
       calendarEventId: task?.calendarEventId || null,
       createdAt: task?.createdAt || new Date().toISOString()
-    });
+    }, repeat);
   };
 
   return (
@@ -1096,6 +1182,35 @@ const TaskModal = ({ task, onSave, onClose }) => {
             <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5 block">Scheduled Start</label>
             <input className="input" type="datetime-local" value={start} onChange={e => setStart(e.target.value)} />
           </div>
+
+          {!isEditing && (
+            <div>
+              <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5 block flex items-center gap-1.5">
+                <span>🔁 Repeat</span>
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  { id:'none',     label:'Once' },
+                  { id:'daily',    label:'Daily' },
+                  { id:'weekdays', label:'Mon–Fri' },
+                  { id:'weekends', label:'Sat–Sun' },
+                  { id:'weekly',   label:`Weekly · ${WEEKDAYS[new Date(start).getDay()]}` }
+                ].map(opt => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    className={`tab-pill ${repeat === opt.id ? 'active' : ''}`}
+                    onClick={() => setRepeat(opt.id)}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              {repeat !== 'none' && (
+                <p className="text-[11px] text-amber-300/70 mt-2">⚡ A copy will be auto-created each matching day at this time.</p>
+              )}
+            </div>
+          )}
 
           <div>
             <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5 block">Override Rank (optional)</label>
@@ -1309,11 +1424,13 @@ const DashboardView = ({ profile, tasks, onAddTask, onStartTask, onCompleteTask,
 };
 
 // ── Tasks View ────────────────────────────────────────────────────────────────
-const TasksView = ({ tasks, onAddTask, onStartTask, onCompleteTask, onFailTask, onDeleteTask, onEditTask }) => {
+const TasksView = ({ tasks, recurringTasks = [], onAddTask, onStartTask, onCompleteTask, onFailTask, onDeleteTask, onEditTask, onDeleteRecurring }) => {
   const [filter, setFilter] = useState('all');
   const [rankFilter, setRankFilter] = useState('all');
   const [sort, setSort] = useState('time');
   const [search, setSearch] = useState('');
+  const [showRecurring, setShowRecurring] = useState(false);
+  const activeRecurring = recurringTasks.filter(r => r.active);
 
   const filtered = tasks.filter(t => {
     if (filter === 'today' && !isToday(t.scheduledStart)) return false;
@@ -1338,6 +1455,44 @@ const TasksView = ({ tasks, onAddTask, onStartTask, onCompleteTask, onFailTask, 
         <button className="btn btn-primary" onClick={onAddTask}>+ New Task</button>
       </div>
       <input className="input" placeholder="🔍 Search tasks..." value={search} onChange={e => setSearch(e.target.value)} />
+
+      {/* Recurring templates manager */}
+      {activeRecurring.length > 0 && (
+        <div className="card border border-purple-500/20 bg-gradient-to-br from-purple-500/5 to-transparent">
+          <button className="w-full flex items-center justify-between text-left" onClick={() => setShowRecurring(s => !s)}>
+            <div className="flex items-center gap-2">
+              <span className="text-lg">🔁</span>
+              <span className="font-bold text-sm">Repeating Tasks</span>
+              <span className="text-[11px] text-purple-300 bg-purple-500/15 px-2 py-0.5 rounded-full font-bold">{activeRecurring.length}</span>
+            </div>
+            <span className="text-gray-500 text-sm">{showRecurring ? '▾' : '▸'}</span>
+          </button>
+          {showRecurring && (
+            <div className="mt-3 space-y-2">
+              {activeRecurring.map(r => (
+                <div key={r.id} className="flex items-center justify-between gap-3 p-3 rounded-xl bg-white/[0.02] border border-white/5">
+                  <div className="min-w-0 flex-1">
+                    <div className="font-semibold text-sm truncate">{r.title}</div>
+                    <div className="text-[11px] text-gray-500 mt-0.5 font-mono">
+                      {describeRecurrence(r)} · {String(r.hour ?? 9).padStart(2,'0')}:{String(r.minute ?? 0).padStart(2,'0')} · {r.duration}m
+                    </div>
+                  </div>
+                  <button
+                    className="btn btn-ghost btn-sm shrink-0"
+                    title="Delete repeat (stops future copies, keeps existing ones)"
+                    onClick={() => {
+                      if (confirm(`Stop repeating "${r.title}"? Existing instances stay, but no new ones will be created.`)) {
+                        onDeleteRecurring(r.id);
+                      }
+                    }}
+                  >🗑</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="flex flex-wrap gap-2">
         {['all','today','upcoming','pending','completed','failed'].map(f => (
           <button key={f} className={`tab-pill ${filter === f ? 'active' : ''}`} onClick={() => setFilter(f)}>
@@ -1879,38 +2034,65 @@ const SettingsView = ({ settings, profile, onSaveSettings, onResetProfile, onUpd
 };
 
 // ── Welcome ───────────────────────────────────────────────────────────────────
-const WelcomeScreen = ({ onStart }) => {
+const WelcomeScreen = ({ onStart, onRestore }) => {
   const [name, setName] = useState('');
+  const [restoring, setRestoring] = useState(false);
+
+  const handleRestore = async () => {
+    setRestoring(true);
+    const ok = await onRestore();
+    setRestoring(false);
+    return ok;
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-950 p-4 overflow-y-auto">
       <div className="max-w-xl w-full py-8 animate-fadeIn">
-        <div className="text-center mb-8">
+        <div className="text-center mb-6">
           <div className="inline-flex items-center justify-center w-24 h-24 rounded-3xl bg-gradient-to-br from-amber-300 to-orange-600 text-5xl font-black text-black shadow-2xl shadow-amber-500/40 mb-5 animate-float">G</div>
           <div className="font-display text-sm tracking-[0.4em] text-gray-400 mb-1">THE</div>
           <h1 className="font-display text-5xl sm:text-6xl bg-gradient-to-r from-amber-300 via-amber-400 to-orange-400 bg-clip-text text-transparent mb-3 tracking-tight">GRIND</h1>
-          <p className="text-gray-400 text-base sm:text-lg leading-relaxed">Daily execution. No excuses.<br/><span className="text-gray-500 text-sm">Turn every task into XP, coins, and progress.</span></p>
+          <p className="text-gray-400 text-base sm:text-lg leading-relaxed">Daily execution. No excuses.</p>
         </div>
 
-        <div className="card mb-5">
+        {/* Restore from cloud — for returning users on a fresh device or after cache clear */}
+        <div className="card mb-4 border border-blue-500/30 bg-gradient-to-br from-blue-500/10 to-cyan-500/5">
+          <div className="flex items-start gap-3 mb-3">
+            <div className="text-2xl">☁️</div>
+            <div className="flex-1">
+              <h3 className="font-bold text-blue-300 text-sm mb-0.5">Used this app before?</h3>
+              <p className="text-xs text-gray-400 leading-relaxed">Sign in with the same Google account to restore your tasks, level, and coins from Drive.</p>
+            </div>
+          </div>
+          <button className="btn btn-secondary w-full" onClick={handleRestore} disabled={restoring}>
+            {restoring ? '☁️ Restoring...' : '🔄 Restore from Google'}
+          </button>
+        </div>
+
+        <div className="flex items-center gap-3 my-5">
+          <div className="flex-1 h-px bg-white/10" />
+          <span className="text-[10px] text-gray-600 uppercase tracking-widest font-semibold">Or start fresh</span>
+          <div className="flex-1 h-px bg-white/10" />
+        </div>
+
+        <div className="card mb-4">
           <h3 className="font-bold text-amber-400 mb-3 text-sm uppercase tracking-wider">The Rules</h3>
-          <ul className="space-y-2.5 text-sm text-gray-300">
+          <ul className="space-y-2 text-sm text-gray-300">
             <li className="flex gap-3"><span className="text-emerald-400">✅</span><div><strong>Ship tasks</strong> → Earn XP & Coins (ranks E to SSS)</div></li>
             <li className="flex gap-3"><span className="text-cyan-400">📈</span><div><strong>Level up</strong> → Unlock story beats & boost stats</div></li>
             <li className="flex gap-3"><span className="text-amber-400">🏪</span><div><strong>Spend coins</strong> → Real rewards & power-ups</div></li>
             <li className="flex gap-3"><span className="text-orange-400">🔥</span><div><strong>Build streaks</strong> → Up to +70% bonus rewards</div></li>
-            <li className="flex gap-3"><span className="text-red-400">⚠️</span><div><strong>Drop the ball</strong> → Real consequences</div></li>
           </ul>
         </div>
 
-        <div className="card mb-5">
+        <div className="card mb-4">
           <label className="text-xs text-gray-400 mb-2 block uppercase tracking-wider font-semibold">What's your name?</label>
-          <input className="input text-center text-lg font-display" value={name} onChange={e => setName(e.target.value)} placeholder="Enter your name..." onKeyDown={e => e.key === 'Enter' && name.trim() && onStart(name.trim())} autoFocus />
+          <input className="input text-center text-lg font-display" value={name} onChange={e => setName(e.target.value)} placeholder="Enter your name..." onKeyDown={e => e.key === 'Enter' && name.trim() && onStart(name.trim())} />
         </div>
 
         <button className="btn btn-primary btn-lg w-full animate-pulseGold text-lg" onClick={() => onStart(name.trim() || 'Founder')} disabled={!name.trim()}>
           Start Grinding 🔥
         </button>
-        <p className="text-center text-[11px] text-gray-600 mt-4">Tip: connect Google in Settings to sync across devices.</p>
       </div>
     </div>
   );
@@ -2053,6 +2235,7 @@ const App = () => {
   const [view, setView] = useState('dashboard');
   const [profile, setProfile] = useState(null);
   const [tasks, setTasks] = useState([]);
+  const [recurringTasks, setRecurringTasks] = useState([]);
   const [inventory, setInventory] = useState(defaultInventory());
   const [settings, setSettings] = useState(defaultSettings());
   const [showTaskModal, setShowTaskModal] = useState(false);
@@ -2077,10 +2260,11 @@ const App = () => {
     setSyncStatus('syncing');
     const payload = {
       version: 1,
-      profile: JSON.parse(localStorage.getItem('grind_user_profile') || 'null'),
-      tasks:   JSON.parse(localStorage.getItem('grind_tasks') || 'null'),
+      profile:   JSON.parse(localStorage.getItem('grind_user_profile') || 'null'),
+      tasks:     JSON.parse(localStorage.getItem('grind_tasks') || 'null'),
       inventory: JSON.parse(localStorage.getItem('grind_inventory') || 'null'),
-      settings:  JSON.parse(localStorage.getItem('grind_settings') || 'null')
+      settings:  JSON.parse(localStorage.getItem('grind_settings') || 'null'),
+      recurring: JSON.parse(localStorage.getItem('grind_recurring') || 'null')
     };
     const ok = await saveDriveData(payload);
     setSyncStatus(ok ? 'synced' : 'error');
@@ -2106,13 +2290,22 @@ const App = () => {
     (async () => {
       try {
         // 1. Load from local FIRST — never block UI on Google APIs
-        const [p, t, inv, sett] = await Promise.all([
-          load('user_profile'), load('tasks'), load('inventory'), load('settings')
+        const [p, t, inv, sett, rec] = await Promise.all([
+          load('user_profile'), load('tasks'), load('inventory'), load('settings'), load('recurring')
         ]);
         if (cancelled) return;
         if (p) {
           setProfile(p);
-          setTasks(t?.tasks || []);
+          const loadedTasks = t?.tasks || [];
+          const loadedRecurring = rec?.recurring || [];
+          // Generate any missing instances since last open
+          const gen = generateRecurringInstances(loadedRecurring, loadedTasks);
+          setTasks(gen.updatedTasks);
+          setRecurringTasks(gen.updatedRecurring);
+          if (gen.createdCount > 0) {
+            await save('tasks', { tasks: gen.updatedTasks });
+            await save('recurring', { recurring: gen.updatedRecurring });
+          }
           setInventory(inv || defaultInventory());
           setSettings(sett || defaultSettings());
         } else {
@@ -2152,9 +2345,19 @@ const App = () => {
             if (drive.tasks)     await save('tasks', drive.tasks);
             if (drive.inventory) await save('inventory', drive.inventory);
             if (drive.settings)  await save('settings', drive.settings);
+            if (drive.recurring) await save('recurring', drive.recurring);
             localStorage.setItem('grind_lastSync', drive.syncedAt);
+            // Generate any missing instances after restore (different device, different last-open day)
+            const loadedTasks = drive.tasks?.tasks || [];
+            const loadedRecurring = drive.recurring?.recurring || [];
+            const gen = generateRecurringInstances(loadedRecurring, loadedTasks);
+            if (gen.createdCount > 0) {
+              await save('tasks', { tasks: gen.updatedTasks });
+              await save('recurring', { recurring: gen.updatedRecurring });
+            }
             setProfile(drive.profile);
-            setTasks(drive.tasks?.tasks || []);
+            setTasks(gen.updatedTasks);
+            setRecurringTasks(gen.updatedRecurring);
             setInventory(drive.inventory || defaultInventory());
             setSettings(drive.settings || defaultSettings());
             setShowWelcome(false);
@@ -2309,11 +2512,13 @@ const App = () => {
     setInventory(defaultInventory());
     setSettings(defaultSettings());
     setTasks([]);
+    setRecurringTasks([]);
     await Promise.all([
       save('user_profile', p),
       save('tasks', { tasks: [] }),
       save('inventory', defaultInventory()),
-      save('settings', defaultSettings())
+      save('settings', defaultSettings()),
+      save('recurring', { recurring: [] })
     ]);
     setShowWelcome(false);
   };
@@ -2321,8 +2526,34 @@ const App = () => {
   const handleAddTask = useCallback(() => { setEditingTask(null); setShowTaskModal(true); }, []);
   const handleEditTask = useCallback(task => { setEditingTask(task); setShowTaskModal(true); }, []);
 
-  const handleSaveTask = useCallback(async (task) => {
+  const handleSaveTask = useCallback(async (task, repeat = 'none') => {
     const isNew = !editingTask;
+
+    // If user selected a repeat pattern on a new task, create a recurring template
+    if (isNew && repeat && repeat !== 'none') {
+      const startDate = new Date(task.scheduledStart);
+      const tmpl = {
+        id: 'rec_' + uuid(),
+        title: task.title,
+        description: task.description,
+        duration: task.duration,
+        complexity: task.complexity,
+        manualRank: task.manualRank || '',
+        hour: startDate.getHours(),
+        minute: startDate.getMinutes(),
+        recurrenceType: repeat,
+        weekday: startDate.getDay(),
+        lastGenerated: startDate.toISOString().split('T')[0],
+        active: true,
+        createdAt: new Date().toISOString()
+      };
+      const newRecurring = [...recurringTasks, tmpl];
+      setRecurringTasks(newRecurring);
+      await save('recurring', { recurring: newRecurring });
+      task = { ...task, parentRecurringId: tmpl.id };
+      showToast(`Repeat saved · ${describeRecurrence(tmpl)}`, 'success', '🔁');
+    }
+
     // Mark as pending calendar sync if sync is on; cleared when sync succeeds
     const taskWithFlag = settings.calendarSync && isNew ? { ...task, pendingCalendarSync: true } : task;
     const newTasks = isNew ? [...tasks, taskWithFlag] : tasks.map(t => t.id === task.id ? task : t);
@@ -2362,7 +2593,7 @@ const App = () => {
     } else {
       showToast(isNew ? 'Task created' : 'Task updated', 'success', '📋');
     }
-  }, [tasks, editingTask, settings.calendarSync, showToast]);
+  }, [tasks, recurringTasks, editingTask, settings.calendarSync, showToast]);
 
   const handleStartTask = useCallback(async (id) => {
     const newTasks = tasks.map(t => t.id === id ? { ...t, status: 'in_progress' } : t);
@@ -2544,8 +2775,17 @@ const App = () => {
           if (drive.tasks)     await save('tasks', drive.tasks);
           if (drive.inventory) await save('inventory', drive.inventory);
           if (drive.settings)  await save('settings', { ...drive.settings, calendarSync: true });
+          if (drive.recurring) await save('recurring', drive.recurring);
+          const loadedTasks = drive.tasks?.tasks || [];
+          const loadedRecurring = drive.recurring?.recurring || [];
+          const gen = generateRecurringInstances(loadedRecurring, loadedTasks);
+          if (gen.createdCount > 0) {
+            await save('tasks', { tasks: gen.updatedTasks });
+            await save('recurring', { recurring: gen.updatedRecurring });
+          }
           setProfile(drive.profile);
-          setTasks(drive.tasks?.tasks || []);
+          setTasks(gen.updatedTasks);
+          setRecurringTasks(gen.updatedRecurring);
           setInventory(drive.inventory || defaultInventory());
           setSettings({ ...(drive.settings || defaultSettings()), calendarSync: true });
           localStorage.setItem('grind_lastSync', drive.syncedAt);
@@ -2576,6 +2816,13 @@ const App = () => {
     showToast('Disconnected from Google', 'info', '☁️');
   }, [settings, showToast]);
 
+  const handleDeleteRecurring = useCallback(async (recId) => {
+    const newRecurring = recurringTasks.filter(r => r.id !== recId);
+    setRecurringTasks(newRecurring);
+    await save('recurring', { recurring: newRecurring });
+    showToast('Repeat stopped — existing tasks kept', 'info', '🔁');
+  }, [recurringTasks, showToast]);
+
   const handleResetProfile = useCallback(async () => {
     if (!confirm('Reset ALL progress? This cannot be undone!')) return;
     const p = defaultProfile();
@@ -2583,17 +2830,67 @@ const App = () => {
     setInventory(defaultInventory());
     setSettings(defaultSettings());
     setTasks([]);
+    setRecurringTasks([]);
     await Promise.all([
       save('user_profile', p),
       save('tasks', { tasks: [] }),
       save('inventory', defaultInventory()),
-      save('settings', defaultSettings())
+      save('settings', defaultSettings()),
+      save('recurring', { recurring: [] })
     ]);
     setShowWelcome(true);
   }, []);
 
+  const handleRestoreFromCloud = useCallback(async () => {
+    showToast('Opening Google sign-in...', 'info', '☁️');
+    setDriveSyncHook(null); // Pause auto-sync during restore
+    const ok = await requestCalendarAuth();
+    if (!ok) {
+      setDriveSyncHook(scheduleDriveSync);
+      showToast('Sign-in failed', 'error', '❌');
+      return false;
+    }
+    setCalConnected(true);
+    try {
+      const drive = await loadDriveData();
+      if (drive && drive.profile) {
+        await save('user_profile', drive.profile);
+        if (drive.tasks)     await save('tasks', drive.tasks);
+        if (drive.inventory) await save('inventory', drive.inventory);
+        if (drive.settings)  await save('settings', { ...drive.settings, calendarSync: true });
+        if (drive.recurring) await save('recurring', drive.recurring);
+        const loadedTasks = drive.tasks?.tasks || [];
+        const loadedRecurring = drive.recurring?.recurring || [];
+        const gen = generateRecurringInstances(loadedRecurring, loadedTasks);
+        if (gen.createdCount > 0) {
+          await save('tasks', { tasks: gen.updatedTasks });
+          await save('recurring', { recurring: gen.updatedRecurring });
+        }
+        localStorage.setItem('grind_lastSync', drive.syncedAt || new Date().toISOString());
+        setProfile(drive.profile);
+        setTasks(gen.updatedTasks);
+        setRecurringTasks(gen.updatedRecurring);
+        setInventory(drive.inventory || defaultInventory());
+        setSettings({ ...(drive.settings || defaultSettings()), calendarSync: true });
+        setShowWelcome(false);
+        setSyncStatus('synced');
+        setDriveSyncHook(scheduleDriveSync);
+        showToast('Welcome back! Data restored ✨', 'success', '☁️');
+        return true;
+      } else {
+        setDriveSyncHook(scheduleDriveSync);
+        showToast('No previous data found in your Drive', 'info', '☁️');
+        return false;
+      }
+    } catch(e) {
+      setDriveSyncHook(scheduleDriveSync);
+      showToast('Restore failed — check console', 'error', '❌');
+      return false;
+    }
+  }, [showToast, scheduleDriveSync]);
+
   if (loading) return <LoadingScreen message={loadingMsg} />;
-  if (showWelcome) return <WelcomeScreen onStart={handleWelcomeStart} />;
+  if (showWelcome) return <WelcomeScreen onStart={handleWelcomeStart} onRestore={handleRestoreFromCloud} />;
   if (!profile) return <LoadingScreen />;
 
   const pendingCount = tasks.filter(t => t.status === 'pending' && isToday(t.scheduledStart)).length;
@@ -2605,7 +2902,7 @@ const App = () => {
         <Sidebar view={view} onNav={setView} taskCount={pendingCount} profile={profile} />
         <main className="flex-1 p-4 sm:p-5 lg:p-6 main-area min-w-0 max-w-7xl">
           {view === 'dashboard' && <DashboardView profile={profile} tasks={tasks} onAddTask={handleAddTask} onStartTask={handleStartTask} onCompleteTask={handleCompleteTask} onFailTask={handleFailTask} onDeleteTask={handleDeleteTask} onEditTask={handleEditTask} />}
-          {view === 'tasks' && <TasksView tasks={tasks} onAddTask={handleAddTask} onStartTask={handleStartTask} onCompleteTask={handleCompleteTask} onFailTask={handleFailTask} onDeleteTask={handleDeleteTask} onEditTask={handleEditTask} />}
+          {view === 'tasks' && <TasksView tasks={tasks} recurringTasks={recurringTasks} onAddTask={handleAddTask} onStartTask={handleStartTask} onCompleteTask={handleCompleteTask} onFailTask={handleFailTask} onDeleteTask={handleDeleteTask} onEditTask={handleEditTask} onDeleteRecurring={handleDeleteRecurring} />}
           {view === 'shop' && <ShopView profile={profile} inventory={inventory} onBuy={handleBuyItem} />}
           {view === 'inventory' && <InventoryView inventory={inventory} onUseItem={handleUseItem} onRedeemReward={handleRedeemReward} />}
           {view === 'story' && <StoryView profile={profile} />}
