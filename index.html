@@ -377,22 +377,35 @@ const initGoogleAPIs = () => new Promise((resolve) => {
   tryInit();
 });
 
+// Force a fresh OAuth consent — ignores cached tokens.
+// Use this when the user explicitly clicks "Connect" so we always pick up new scopes.
 const requestCalendarAuth = () => new Promise((resolve) => {
-  if (!tokenClient) return resolve(false);
+  if (!tokenClient) {
+    console.warn('[GRIND] OAuth: tokenClient not initialized');
+    return resolve(false);
+  }
   tokenClient.callback = (resp) => {
-    if (resp.error) return resolve(false);
-    try { localStorage.setItem('grind_gtoken', JSON.stringify({ token: resp.access_token, expires: Date.now() + (resp.expires_in*1000) })); } catch(e) {}
+    if (resp.error || !resp.access_token) {
+      console.warn('[GRIND] OAuth: failed', resp);
+      return resolve(false);
+    }
+    console.log('[GRIND] OAuth: granted scopes:', resp.scope);
+    try {
+      localStorage.setItem('grind_gtoken', JSON.stringify({
+        token: resp.access_token,
+        expires: Date.now() + (resp.expires_in * 1000),
+        scope: resp.scope || ''
+      }));
+    } catch(e) {}
     if (window.gapi?.client) window.gapi.client.setToken({ access_token: resp.access_token });
     resolve(true);
   };
   try {
-    const existing = JSON.parse(localStorage.getItem('grind_gtoken') || 'null');
-    if (existing?.token && existing.expires > Date.now() + 60000) {
-      window.gapi.client.setToken({ access_token: existing.token });
-      return resolve(true);
-    }
-  } catch(e) {}
-  tokenClient.requestAccessToken({ prompt: 'consent' });
+    tokenClient.requestAccessToken({ prompt: 'consent' });
+  } catch(e) {
+    console.warn('[GRIND] OAuth: requestAccessToken threw', e);
+    resolve(false);
+  }
 });
 
 const restoreToken = () => {
@@ -487,7 +500,8 @@ let lastDriveSyncAt = null;
 let driveSyncing = false;
 
 const findDriveFile = async () => {
-  if (!isGoogleConnected() || !window.gapi?.client?.drive) return null;
+  if (!isGoogleConnected()) { console.warn('[GRIND] Drive: not connected'); return null; }
+  if (!window.gapi?.client?.drive) { console.warn('[GRIND] Drive: client.drive not loaded'); return null; }
   restoreToken();
   try {
     const r = await window.gapi.client.drive.files.list({
@@ -495,8 +509,13 @@ const findDriveFile = async () => {
       spaces: 'appDataFolder',
       fields: 'files(id,name,modifiedTime)'
     });
-    return r.result?.files?.[0] || null;
-  } catch(e) { console.warn('Drive list failed', e); return null; }
+    const f = r.result?.files?.[0] || null;
+    console.log('[GRIND] Drive: file found =', !!f, f);
+    return f;
+  } catch(e) {
+    console.warn('[GRIND] Drive list failed:', e?.result?.error?.message || e?.message || e);
+    return null;
+  }
 };
 
 const loadDriveData = async () => {
@@ -505,8 +524,13 @@ const loadDriveData = async () => {
   driveFileId = file.id;
   try {
     const r = await window.gapi.client.drive.files.get({ fileId: file.id, alt: 'media' });
-    return typeof r.result === 'string' ? JSON.parse(r.result) : (r.result || JSON.parse(r.body));
-  } catch(e) { console.warn('Drive load failed', e); return null; }
+    const data = typeof r.result === 'string' ? JSON.parse(r.result) : (r.result || JSON.parse(r.body));
+    console.log('[GRIND] Drive: data loaded, has profile =', !!data?.profile, ', tasks =', data?.tasks?.tasks?.length || 0);
+    return data;
+  } catch(e) {
+    console.warn('[GRIND] Drive load failed:', e?.result?.error?.message || e?.message || e);
+    return null;
+  }
 };
 
 const saveDriveData = async (payload) => {
@@ -2747,21 +2771,35 @@ const App = () => {
   const handleUpdateName = useCallback(async (name) => { const newP = { ...profile, characterName: name }; setProfile(newP); await save('user_profile', newP); }, [profile]);
 
   const handleCalendarConnect = useCallback(async () => {
-    showToast('Opening Google sign-in...', 'info', '🔄');
-    // Pause auto-sync during the connect transition
+    showToast('Step 1/4 — Sign in to Google', 'info', '🔐');
     setDriveSyncHook(null);
     if (syncTimerRef.current) { clearTimeout(syncTimerRef.current); syncTimerRef.current = null; }
+
+    if (!gapiInited || !gisInited) {
+      showToast('Loading Google libraries...', 'info', '⏳');
+      await initGoogleAPIs();
+    }
 
     const ok = await requestCalendarAuth();
     if (!ok) {
       setDriveSyncHook(scheduleDriveSync);
-      showToast('Sign-in failed — check console & authorized origins', 'error', '❌');
+      showToast('Sign-in failed — popup may be blocked, or origin not authorised', 'error', '❌');
       setSyncStatus('error');
       return;
     }
     setCalConnected(true);
     setSyncStatus('syncing');
-    showToast('Connected! Checking cloud...', 'success', '☁️');
+    showToast('Step 2/4 — Checking cloud for existing data...', 'info', '☁️');
+
+    // Decide if local is "essentially empty" (fresh welcome with no progress)
+    const localIsEmpty = (() => {
+      try {
+        const p = JSON.parse(localStorage.getItem('grind_user_profile') || 'null');
+        const tArr = JSON.parse(localStorage.getItem('grind_tasks') || '{"tasks":[]}').tasks || [];
+        if (!p) return true;
+        return (p.totalTasks || 0) === 0 && (p.totalXP || 0) === 0 && p.level === 1 && tArr.length === 0;
+      } catch(e) { return true; }
+    })();
 
     // Always check Drive FIRST so we don't overwrite cloud with local
     let restoredFromCloud = false;
@@ -2770,7 +2808,13 @@ const App = () => {
       if (drive && drive.profile) {
         const localTime = localStorage.getItem('grind_lastSync');
         const driveTime = drive.syncedAt;
-        if (!localTime || (driveTime && new Date(driveTime) > new Date(localTime))) {
+        const driveIsNewer = !localTime || (driveTime && new Date(driveTime) > new Date(localTime));
+        const driveTaskCount = drive.tasks?.tasks?.length || 0;
+        // Restore if Drive is newer OR if local is essentially empty
+        const shouldRestore = driveIsNewer || (localIsEmpty && (driveTaskCount > 0 || (drive.profile.totalTasks || 0) > 0));
+        console.log('[GRIND] Connect: localIsEmpty=', localIsEmpty, 'driveIsNewer=', driveIsNewer, 'driveTaskCount=', driveTaskCount, 'shouldRestore=', shouldRestore);
+        if (shouldRestore) {
+          showToast(`Step 3/4 — Restoring ${driveTaskCount} task${driveTaskCount === 1 ? '' : 's'} from cloud...`, 'info', '✨');
           if (drive.profile)   await save('user_profile', drive.profile);
           if (drive.tasks)     await save('tasks', drive.tasks);
           if (drive.inventory) await save('inventory', drive.inventory);
@@ -2788,12 +2832,19 @@ const App = () => {
           setRecurringTasks(gen.updatedRecurring);
           setInventory(drive.inventory || defaultInventory());
           setSettings({ ...(drive.settings || defaultSettings()), calendarSync: true });
-          localStorage.setItem('grind_lastSync', drive.syncedAt);
+          localStorage.setItem('grind_lastSync', drive.syncedAt || new Date().toISOString());
           restoredFromCloud = true;
-          showToast('Restored data from cloud ☁️', 'success', '✨');
+          showToast(`Step 4/4 — Restored ${driveTaskCount} task${driveTaskCount === 1 ? '' : 's'} ✨`, 'success', '☁️');
+        } else {
+          showToast('Local data is more recent than cloud — keeping local', 'info', '💾');
         }
+      } else {
+        showToast('Step 3/4 — No prior cloud data found', 'info', '☁️');
       }
-    } catch(e) { console.warn('Drive restore failed', e); }
+    } catch(e) {
+      console.error('[GRIND] Drive restore threw:', e);
+      showToast('Could not read Drive — see console', 'warning', '⚠️');
+    }
 
     if (!restoredFromCloud) {
       const newS = { ...settings, calendarSync: true };
@@ -2804,13 +2855,15 @@ const App = () => {
     // Re-enable auto-sync, then push current state to Drive
     setDriveSyncHook(scheduleDriveSync);
     const ok2 = await performDriveSync();
-    if (ok2 !== false) showToast('All data synced ☁️', 'success', '✅');
+    if (!restoredFromCloud && ok2 !== false) showToast('Synced to cloud ☁️', 'success', '✅');
   }, [settings, showToast, scheduleDriveSync, performDriveSync]);
 
   const handleCalendarDisconnect = useCallback(async () => {
     disconnectCalendar();
     setCalConnected(false);
     setSyncStatus('offline');
+    // Clear lastSync so a fresh reconnect doesn't think local is newer than Drive
+    localStorage.removeItem('grind_lastSync');
     const newS = { ...settings, calendarSync: false };
     setSettings(newS); await save('settings', newS);
     showToast('Disconnected from Google', 'info', '☁️');
@@ -2842,49 +2895,76 @@ const App = () => {
   }, []);
 
   const handleRestoreFromCloud = useCallback(async () => {
-    showToast('Opening Google sign-in...', 'info', '☁️');
-    setDriveSyncHook(null); // Pause auto-sync during restore
+    showToast('Step 1/4 — Sign in to Google', 'info', '🔐');
+    setDriveSyncHook(null);
+
+    // Make sure Google APIs are ready (in case user clicks Restore before they init)
+    if (!gapiInited || !gisInited) {
+      showToast('Loading Google libraries...', 'info', '⏳');
+      await initGoogleAPIs();
+    }
+
     const ok = await requestCalendarAuth();
     if (!ok) {
       setDriveSyncHook(scheduleDriveSync);
-      showToast('Sign-in failed', 'error', '❌');
+      showToast('Sign-in failed — popup may be blocked', 'error', '❌');
       return false;
     }
     setCalConnected(true);
+    showToast('Step 2/4 — Reading your Drive...', 'info', '☁️');
+
+    let drive;
     try {
-      const drive = await loadDriveData();
-      if (drive && drive.profile) {
-        await save('user_profile', drive.profile);
-        if (drive.tasks)     await save('tasks', drive.tasks);
-        if (drive.inventory) await save('inventory', drive.inventory);
-        if (drive.settings)  await save('settings', { ...drive.settings, calendarSync: true });
-        if (drive.recurring) await save('recurring', drive.recurring);
-        const loadedTasks = drive.tasks?.tasks || [];
-        const loadedRecurring = drive.recurring?.recurring || [];
-        const gen = generateRecurringInstances(loadedRecurring, loadedTasks);
-        if (gen.createdCount > 0) {
-          await save('tasks', { tasks: gen.updatedTasks });
-          await save('recurring', { recurring: gen.updatedRecurring });
-        }
-        localStorage.setItem('grind_lastSync', drive.syncedAt || new Date().toISOString());
-        setProfile(drive.profile);
-        setTasks(gen.updatedTasks);
-        setRecurringTasks(gen.updatedRecurring);
-        setInventory(drive.inventory || defaultInventory());
-        setSettings({ ...(drive.settings || defaultSettings()), calendarSync: true });
-        setShowWelcome(false);
-        setSyncStatus('synced');
-        setDriveSyncHook(scheduleDriveSync);
-        showToast('Welcome back! Data restored ✨', 'success', '☁️');
-        return true;
-      } else {
-        setDriveSyncHook(scheduleDriveSync);
-        showToast('No previous data found in your Drive', 'info', '☁️');
-        return false;
-      }
+      drive = await loadDriveData();
     } catch(e) {
+      console.error('[GRIND] Drive load threw:', e);
       setDriveSyncHook(scheduleDriveSync);
-      showToast('Restore failed — check console', 'error', '❌');
+      showToast('Could not read Drive — see console', 'error', '❌');
+      return false;
+    }
+
+    if (!drive) {
+      setDriveSyncHook(scheduleDriveSync);
+      showToast('No previous data found in your Drive', 'info', '☁️');
+      return false;
+    }
+    if (!drive.profile) {
+      setDriveSyncHook(scheduleDriveSync);
+      showToast('Cloud file exists but is empty', 'warning', '⚠️');
+      return false;
+    }
+
+    const taskCount = drive.tasks?.tasks?.length || 0;
+    showToast(`Step 3/4 — Restoring ${taskCount} task${taskCount === 1 ? '' : 's'}...`, 'info', '✨');
+
+    try {
+      await save('user_profile', drive.profile);
+      if (drive.tasks)     await save('tasks', drive.tasks);
+      if (drive.inventory) await save('inventory', drive.inventory);
+      if (drive.settings)  await save('settings', { ...drive.settings, calendarSync: true });
+      if (drive.recurring) await save('recurring', drive.recurring);
+      const loadedTasks = drive.tasks?.tasks || [];
+      const loadedRecurring = drive.recurring?.recurring || [];
+      const gen = generateRecurringInstances(loadedRecurring, loadedTasks);
+      if (gen.createdCount > 0) {
+        await save('tasks', { tasks: gen.updatedTasks });
+        await save('recurring', { recurring: gen.updatedRecurring });
+      }
+      localStorage.setItem('grind_lastSync', drive.syncedAt || new Date().toISOString());
+      setProfile(drive.profile);
+      setTasks(gen.updatedTasks);
+      setRecurringTasks(gen.updatedRecurring);
+      setInventory(drive.inventory || defaultInventory());
+      setSettings({ ...(drive.settings || defaultSettings()), calendarSync: true });
+      setShowWelcome(false);
+      setSyncStatus('synced');
+      setDriveSyncHook(scheduleDriveSync);
+      showToast(`Step 4/4 — Welcome back! ${taskCount} task${taskCount === 1 ? '' : 's'} restored ✨`, 'success', '☁️');
+      return true;
+    } catch(e) {
+      console.error('[GRIND] Restore write failed:', e);
+      setDriveSyncHook(scheduleDriveSync);
+      showToast('Restore write failed — see console', 'error', '❌');
       return false;
     }
   }, [showToast, scheduleDriveSync]);
