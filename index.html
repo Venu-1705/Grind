@@ -48,6 +48,7 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script src="https://apis.google.com/js/api.js" async defer></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   :root {
     --bg-0: #07090f;
@@ -458,6 +459,112 @@ const disconnectCalendar = () => {
     if (window.gapi?.client) window.gapi.client.setToken(null);
     driveFileId = null;
   } catch(e) {}
+};
+
+// ── Supabase (realtime cross-device sync) ─────────────────────────────────────
+const SUPABASE_URL = 'https://tqnahfrtfuvtrbsyeuop.supabase.co';
+const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRxbmFoZnJ0ZnV2dHJic3lldW9wIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk4MjU1MDcsImV4cCI6MjA5NTQwMTUwN30.Q5yTtSgUsU31N2YU98QDF4u_vWbcDlSlzQ_cLBwCSOQ';
+
+let sb = null; // Supabase client
+let sbRealtime = null; // active channel
+let _lastRemoteHash = null; // to detect our own writes echoed back
+const initSupabase = () => {
+  if (sb) return sb;
+  if (!window.supabase) return null;
+  try {
+    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON, {
+      auth: { autoRefreshToken: true, persistSession: true, detectSessionInUrl: true, storageKey: 'grind_sb_auth' }
+    });
+    return sb;
+  } catch(e) { console.warn('[GRIND] Supabase init failed:', e); return null; }
+};
+
+const sbGetSession = async () => {
+  const c = initSupabase();
+  if (!c) return null;
+  try { const { data } = await c.auth.getSession(); return data?.session || null; }
+  catch(e) { return null; }
+};
+
+const sbSignInWithEmail = async (email) => {
+  const c = initSupabase();
+  if (!c) return { error: 'Supabase SDK not loaded' };
+  try {
+    const { error } = await c.auth.signInWithOtp({
+      email,
+      options: { emailRedirectTo: window.location.href.split('#')[0] }
+    });
+    return { error: error?.message || null };
+  } catch(e) { return { error: e.message || String(e) }; }
+};
+
+const sbSignOut = async () => {
+  const c = initSupabase();
+  if (!c) return;
+  try { await c.auth.signOut(); } catch(e) {}
+};
+
+const hashPayload = (obj) => {
+  try { const s = JSON.stringify(obj); let h = 0; for (let i=0;i<s.length;i++){ h = ((h<<5)-h) + s.charCodeAt(i); h|=0; } return h.toString(36); } catch(e) { return ''; }
+};
+
+const sbLoadData = async () => {
+  const c = initSupabase();
+  if (!c) return null;
+  const session = await sbGetSession();
+  if (!session) return null;
+  try {
+    const { data, error } = await c.from('grind_data').select('data, updated_at').eq('user_id', session.user.id).maybeSingle();
+    if (error) { console.warn('[GRIND] Supabase load:', error.message); return null; }
+    return data ? { payload: data.data, updatedAt: data.updated_at } : null;
+  } catch(e) { console.warn('[GRIND] Supabase load threw:', e); return null; }
+};
+
+const sbSaveData = async (payload) => {
+  const c = initSupabase();
+  if (!c) return false;
+  const session = await sbGetSession();
+  if (!session) return false;
+  _lastRemoteHash = hashPayload(payload);
+  try {
+    const { error } = await c.from('grind_data').upsert({
+      user_id: session.user.id,
+      data: payload
+    }, { onConflict: 'user_id' });
+    if (error) { console.warn('[GRIND] Supabase save:', error.message); return false; }
+    return true;
+  } catch(e) { console.warn('[GRIND] Supabase save threw:', e); return false; }
+};
+
+const sbSubscribe = (onChange) => {
+  const c = initSupabase();
+  if (!c) return null;
+  sbGetSession().then(session => {
+    if (!session) return;
+    if (sbRealtime) { try { c.removeChannel(sbRealtime); } catch(e){} sbRealtime = null; }
+    sbRealtime = c.channel('grind_realtime_' + session.user.id)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'grind_data',
+        filter: `user_id=eq.${session.user.id}`
+      }, payload => {
+        const incoming = payload.new?.data;
+        if (!incoming) return;
+        const incomingHash = hashPayload(incoming);
+        if (incomingHash === _lastRemoteHash) return; // our own echo
+        onChange({ payload: incoming, updatedAt: payload.new.updated_at });
+      })
+      .subscribe();
+  });
+};
+
+const sbUnsubscribe = () => {
+  const c = initSupabase();
+  if (c && sbRealtime) {
+    try { c.removeChannel(sbRealtime); } catch(e){}
+    sbRealtime = null;
+  }
 };
 
 // ── Storage (with one-time migration from old rpg_ prefix) ────────────────────
@@ -1966,10 +2073,12 @@ const AnalyticsView = ({ profile, tasks }) => {
 };
 
 // ── Settings View ─────────────────────────────────────────────────────────────
-const SettingsView = ({ settings, profile, onSaveSettings, onResetProfile, onUpdateName, calendarConnected, onCalendarConnect, onCalendarDisconnect }) => {
+const SettingsView = ({ settings, profile, onSaveSettings, onResetProfile, onUpdateName, calendarConnected, onCalendarConnect, onCalendarDisconnect, sbUser, onSignIn, onSignOut, signingIn }) => {
   const [s, setS] = useState(settings);
   const [name, setName] = useState(profile.characterName);
   const [saved, setSaved] = useState(false);
+  const [email, setEmail] = useState('');
+  const [showSignIn, setShowSignIn] = useState(false);
 
   const handleSave = () => {
     onSaveSettings(s);
@@ -2019,6 +2128,51 @@ const SettingsView = ({ settings, profile, onSaveSettings, onResetProfile, onUpd
         </div>
       </div>
 
+      <div className="card border border-emerald-500/20 bg-gradient-to-br from-emerald-500/5 to-transparent">
+        <h3 className="text-[11px] font-bold text-emerald-400 uppercase tracking-widest mb-4">🔄 Realtime Sync (Supabase)</h3>
+        {sbUser ? (
+          <>
+            <div className="flex items-start gap-3 mb-3">
+              <div className="w-10 h-10 rounded-xl flex items-center justify-center text-lg shrink-0 bg-emerald-500/20 text-emerald-400">✓</div>
+              <div className="flex-1 min-w-0">
+                <div className="font-semibold text-sm mb-0.5 truncate">Signed in</div>
+                <p className="text-xs text-gray-500 truncate">{sbUser.email}</p>
+                <p className="text-[10px] text-emerald-300/80 mt-1">Changes sync instantly across all devices using this email.</p>
+              </div>
+            </div>
+            <button className="btn btn-secondary w-full" onClick={onSignOut}>Sign Out</button>
+          </>
+        ) : (
+          <>
+            <div className="flex items-start gap-3 mb-3">
+              <div className="w-10 h-10 rounded-xl flex items-center justify-center text-lg shrink-0 bg-gray-500/20 text-gray-400">○</div>
+              <div className="flex-1 min-w-0">
+                <div className="font-semibold text-sm mb-0.5">Not signed in</div>
+                <p className="text-xs text-gray-500 leading-relaxed">Sign in with email to sync across all your devices in realtime. Magic link — no password.</p>
+              </div>
+            </div>
+            {!showSignIn ? (
+              <button className="btn btn-primary w-full" onClick={() => setShowSignIn(true)}>✉️ Sign in with email</button>
+            ) : (
+              <div className="space-y-2">
+                <input
+                  className="input"
+                  type="email"
+                  placeholder="your@email.com"
+                  value={email}
+                  onChange={e => setEmail(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && email.includes('@') && onSignIn(email)}
+                  autoFocus
+                />
+                <button className="btn btn-primary w-full" onClick={() => onSignIn(email)} disabled={signingIn || !email.includes('@')}>
+                  {signingIn ? 'Sending...' : 'Send magic link'}
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
       <div className="card">
         <h3 className="text-[11px] font-bold text-gray-400 uppercase tracking-widest mb-4">☁️ Cloud Sync & Calendar</h3>
         <div className="flex items-start gap-3 mb-3">
@@ -2058,15 +2212,22 @@ const SettingsView = ({ settings, profile, onSaveSettings, onResetProfile, onUpd
 };
 
 // ── Welcome ───────────────────────────────────────────────────────────────────
-const WelcomeScreen = ({ onStart, onRestore }) => {
+const WelcomeScreen = ({ onStart, onRestore, onSignIn, signingIn }) => {
   const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
   const [restoring, setRestoring] = useState(false);
+  const [showEmail, setShowEmail] = useState(false);
 
   const handleRestore = async () => {
     setRestoring(true);
     const ok = await onRestore();
     setRestoring(false);
     return ok;
+  };
+
+  const handleEmailSubmit = async () => {
+    if (!email.includes('@')) return;
+    await onSignIn(email);
   };
 
   return (
@@ -2079,17 +2240,48 @@ const WelcomeScreen = ({ onStart, onRestore }) => {
           <p className="text-gray-400 text-base sm:text-lg leading-relaxed">Daily execution. No excuses.</p>
         </div>
 
-        {/* Restore from cloud — for returning users on a fresh device or after cache clear */}
-        <div className="card mb-4 border border-blue-500/30 bg-gradient-to-br from-blue-500/10 to-cyan-500/5">
+        {/* Email sign-in (Supabase) — primary path for cross-device sync */}
+        <div className="card mb-4 border border-emerald-500/30 bg-gradient-to-br from-emerald-500/10 to-cyan-500/5">
+          <div className="flex items-start gap-3 mb-3">
+            <div className="text-2xl">📧</div>
+            <div className="flex-1">
+              <h3 className="font-bold text-emerald-300 text-sm mb-0.5">Sign in to sync across devices</h3>
+              <p className="text-xs text-gray-400 leading-relaxed">One email. Same data on phone, laptop, anywhere. We'll send you a one-tap login link.</p>
+            </div>
+          </div>
+          {!showEmail ? (
+            <button className="btn btn-primary w-full" onClick={() => setShowEmail(true)}>
+              ✉️ Sign in with email
+            </button>
+          ) : (
+            <div className="space-y-2">
+              <input
+                className="input"
+                type="email"
+                placeholder="your@email.com"
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && email.includes('@') && handleEmailSubmit()}
+                autoFocus
+              />
+              <button className="btn btn-primary w-full" onClick={handleEmailSubmit} disabled={signingIn || !email.includes('@')}>
+                {signingIn ? '📧 Sending...' : 'Send magic link'}
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Restore from Google Drive — secondary path for those already using Drive */}
+        <div className="card mb-4 border border-blue-500/20 bg-gradient-to-br from-blue-500/5 to-transparent">
           <div className="flex items-start gap-3 mb-3">
             <div className="text-2xl">☁️</div>
             <div className="flex-1">
-              <h3 className="font-bold text-blue-300 text-sm mb-0.5">Used this app before?</h3>
-              <p className="text-xs text-gray-400 leading-relaxed">Sign in with the same Google account to restore your tasks, level, and coins from Drive.</p>
+              <h3 className="font-bold text-blue-300 text-sm mb-0.5">Or: restore from Google Drive</h3>
+              <p className="text-xs text-gray-500 leading-relaxed">If you previously used Drive sync, pull your old data.</p>
             </div>
           </div>
           <button className="btn btn-secondary w-full" onClick={handleRestore} disabled={restoring}>
-            {restoring ? '☁️ Restoring...' : '🔄 Restore from Google'}
+            {restoring ? '☁️ Restoring...' : '🔄 Restore from Google Drive'}
           </button>
         </div>
 
@@ -2269,7 +2461,9 @@ const App = () => {
   const [toasts, setToasts] = useState([]);
   const [achievementToasts, setAchievementToasts] = useState([]);
   const [calConnected, setCalConnected] = useState(false);
-  const [syncStatus, setSyncStatus] = useState('offline'); // synced | syncing | error | offline
+  const [syncStatus, setSyncStatus] = useState('offline');
+  const [sbUser, setSbUser] = useState(null); // Supabase signed-in user
+  const [signingIn, setSigningIn] = useState(false);
   const syncTimerRef = useRef(null);
 
   const showToast = useCallback((message, type = 'success', icon = '✅') => {
@@ -2278,9 +2472,8 @@ const App = () => {
     setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3000);
   }, []);
 
-  // Debounced Drive sync — gathers ALL data from localStorage and uploads
+  // Debounced sync — gathers ALL data and pushes to Supabase (primary) + Drive (optional backup)
   const performDriveSync = useCallback(async () => {
-    if (!isGoogleConnected()) { setSyncStatus('offline'); return; }
     setSyncStatus('syncing');
     const payload = {
       version: 1,
@@ -2290,9 +2483,29 @@ const App = () => {
       settings:  JSON.parse(localStorage.getItem('grind_settings') || 'null'),
       recurring: JSON.parse(localStorage.getItem('grind_recurring') || 'null')
     };
-    const ok = await saveDriveData(payload);
-    setSyncStatus(ok ? 'synced' : 'error');
-    if (ok) localStorage.setItem('grind_lastSync', new Date().toISOString());
+
+    // Push to Supabase (instant cross-device)
+    let sbOk = false;
+    const session = await sbGetSession();
+    if (session) {
+      sbOk = await sbSaveData(payload);
+      if (sbOk) localStorage.setItem('grind_lastSync', new Date().toISOString());
+    }
+
+    // Push to Google Drive (backup, if connected)
+    let driveOk = false;
+    if (isGoogleConnected()) {
+      driveOk = await saveDriveData(payload);
+    }
+
+    if (sbOk || driveOk) {
+      setSyncStatus('synced');
+      if (!session && driveOk) localStorage.setItem('grind_lastSync', new Date().toISOString());
+    } else if (!session && !isGoogleConnected()) {
+      setSyncStatus('offline');
+    } else {
+      setSyncStatus('error');
+    }
   }, []);
 
   const scheduleDriveSync = useCallback(() => {
@@ -2307,6 +2520,101 @@ const App = () => {
     setDriveSyncHook(scheduleDriveSync);
     return () => setDriveSyncHook(null);
   }, [scheduleDriveSync]);
+
+  // Supabase: detect existing session + listen for auth changes
+  useEffect(() => {
+    const client = initSupabase();
+    if (!client) return;
+    let unsub = null;
+    (async () => {
+      const session = await sbGetSession();
+      if (session?.user) {
+        setSbUser(session.user);
+        setSyncStatus('synced');
+      }
+      const { data } = client.auth.onAuthStateChange((event, sess) => {
+        setSbUser(sess?.user || null);
+        if (event === 'SIGNED_OUT') sbUnsubscribe();
+      });
+      unsub = data?.subscription;
+    })();
+    return () => { try { unsub?.unsubscribe(); } catch(e) {} };
+  }, []);
+
+  // Apply incoming Supabase realtime update into local state + storage
+  const applyRemoteData = useCallback(async (remote) => {
+    if (!remote) return;
+    const { payload } = remote;
+    if (!payload || !payload.profile) return;
+    setDriveSyncHook(null); // prevent echo back
+    if (payload.profile)   await save('user_profile', payload.profile);
+    if (payload.tasks)     await save('tasks', payload.tasks);
+    if (payload.inventory) await save('inventory', payload.inventory);
+    if (payload.settings)  await save('settings', payload.settings);
+    if (payload.recurring) await save('recurring', payload.recurring);
+    setProfile(payload.profile);
+    setTasks(payload.tasks?.tasks || []);
+    setInventory(payload.inventory || defaultInventory());
+    setSettings(payload.settings || defaultSettings());
+    setRecurringTasks(payload.recurring?.recurring || []);
+    setShowWelcome(false);
+    localStorage.setItem('grind_lastSync', remote.updatedAt || new Date().toISOString());
+    setDriveSyncHook(scheduleDriveSync);
+    setSyncStatus('synced');
+    showToast('☁️ Synced from another device', 'success', '✨');
+  }, [scheduleDriveSync, showToast]);
+
+  // Subscribe to realtime updates when signed in
+  useEffect(() => {
+    if (!sbUser) return;
+    sbSubscribe(applyRemoteData);
+    return () => sbUnsubscribe();
+  }, [sbUser, applyRemoteData]);
+
+  // On Supabase sign-in, pull their data (replaces local if remote has more)
+  useEffect(() => {
+    if (!sbUser) return;
+    (async () => {
+      const remote = await sbLoadData();
+      if (!remote?.payload?.profile) {
+        // First sign-in on this user — push our local data up
+        await performDriveSync();
+        return;
+      }
+      const localTasks = JSON.parse(localStorage.getItem('grind_tasks') || '{"tasks":[]}').tasks || [];
+      const localProfile = JSON.parse(localStorage.getItem('grind_user_profile') || 'null');
+      const remoteTaskCount = remote.payload.tasks?.tasks?.length || 0;
+      const localIsEmpty = !localProfile || ((localProfile.totalTasks || 0) === 0 && (localProfile.totalXP || 0) === 0 && localProfile.level === 1 && localTasks.length === 0);
+      // If local is empty OR remote is meaningfully newer, restore remote
+      const localTime = localStorage.getItem('grind_lastSync');
+      const remoteIsNewer = !localTime || (remote.updatedAt && new Date(remote.updatedAt) > new Date(localTime));
+      if (localIsEmpty || remoteIsNewer) {
+        await applyRemoteData(remote);
+        showToast(`☁️ Restored ${remoteTaskCount} task${remoteTaskCount === 1 ? '' : 's'} from cloud`, 'success', '✨');
+      } else {
+        // Push local to ensure sync
+        await performDriveSync();
+      }
+    })();
+  }, [sbUser]);
+
+  // Sign-in / sign-out handlers
+  const handleSignIn = useCallback(async (email) => {
+    if (!email || !email.includes('@')) { showToast('Enter a valid email', 'error', '❌'); return false; }
+    setSigningIn(true);
+    const { error } = await sbSignInWithEmail(email.trim());
+    setSigningIn(false);
+    if (error) { showToast(`Sign-in failed: ${error}`, 'error', '❌'); return false; }
+    showToast(`📧 Check your inbox for ${email} — tap the link to sign in`, 'success', '📧');
+    return true;
+  }, [showToast]);
+
+  const handleSignOut = useCallback(async () => {
+    await sbSignOut();
+    setSbUser(null);
+    setSyncStatus('offline');
+    showToast('Signed out', 'info', '☁️');
+  }, [showToast]);
 
   // Boot — show app immediately from local, then sync from Drive in background
   useEffect(() => {
@@ -2409,7 +2717,6 @@ const App = () => {
         const t = JSON.parse(localStorage.getItem('grind_gtoken') || 'null');
         if (t?.token) {
           const msLeft = t.expires - Date.now();
-          // Refresh silently if less than 5 minutes left
           if (msLeft > 0 && msLeft < 5 * 60 * 1000) {
             await silentRefresh();
           }
@@ -2423,13 +2730,72 @@ const App = () => {
     return () => clearInterval(id);
   }, []);
 
-  // Background retry loop: silently sync any tasks with pendingCalendarSync flag
+  // Cross-device sync: periodically pull Drive to catch changes from other devices.
+  // Only pulls if Drive is meaningfully newer than local (>15s gap) to avoid race with our own pushes.
+  const pullInProgressRef = useRef(false);
+  useEffect(() => {
+    if (!calConnected) return;
+    let stopped = false;
+    const pull = async () => {
+      if (pullInProgressRef.current || stopped) return;
+      if (!isGoogleConnected()) return;
+      pullInProgressRef.current = true;
+      try {
+        const drive = await loadDriveData();
+        if (!drive || !drive.profile || stopped) return;
+        const localTime = localStorage.getItem('grind_lastSync');
+        const driveTime = drive.syncedAt;
+        if (!driveTime || !localTime) return;
+        const gap = new Date(driveTime).getTime() - new Date(localTime).getTime();
+        if (gap < 15000) return; // not meaningfully newer
+
+        // Pause local push during restore
+        setDriveSyncHook(null);
+        if (drive.profile)   await save('user_profile', drive.profile);
+        if (drive.tasks)     await save('tasks', drive.tasks);
+        if (drive.inventory) await save('inventory', drive.inventory);
+        if (drive.settings)  await save('settings', drive.settings);
+        if (drive.recurring) await save('recurring', drive.recurring);
+        const loadedTasks = drive.tasks?.tasks || [];
+        const loadedRecurring = drive.recurring?.recurring || [];
+        const gen = generateRecurringInstances(loadedRecurring, loadedTasks);
+        if (gen.createdCount > 0) {
+          await save('tasks', { tasks: gen.updatedTasks });
+          await save('recurring', { recurring: gen.updatedRecurring });
+        }
+        setProfile(drive.profile);
+        setTasks(gen.updatedTasks);
+        setRecurringTasks(gen.updatedRecurring);
+        setInventory(drive.inventory || defaultInventory());
+        setSettings(drive.settings || defaultSettings());
+        localStorage.setItem('grind_lastSync', drive.syncedAt);
+        setDriveSyncHook(scheduleDriveSync);
+        showToast('☁️ Synced changes from another device', 'success', '✨');
+      } catch(e) { console.warn('[GRIND] Background pull failed:', e); }
+      finally { pullInProgressRef.current = false; }
+    };
+    // First poll 30s after connect, then every 45s
+    const initial = setTimeout(pull, 30000);
+    const id = setInterval(pull, 45000);
+    // Also poll when the app regains focus (slight delay so our own push fires first)
+    const onFocus = () => setTimeout(pull, 3000);
+    window.addEventListener('focus', onFocus);
+    return () => {
+      stopped = true;
+      clearTimeout(initial);
+      clearInterval(id);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [calConnected, scheduleDriveSync, showToast]);
+
+  // Background retry loop: silently sync any tasks with pendingCalendarSync flag.
+  // Guarded so it can't run concurrently with itself or duplicate calendar events.
+  const retryInProgressRef = useRef(false);
   useEffect(() => {
     let stopped = false;
     const retryPending = async () => {
-      if (stopped) return;
+      if (retryInProgressRef.current || stopped) return;
       if (!settings.calendarSync) return;
-      // Read fresh state from localStorage so this isn't tied to React state closures
       let currentTasks;
       try {
         currentTasks = JSON.parse(localStorage.getItem('grind_tasks') || '{"tasks":[]}').tasks || [];
@@ -2439,31 +2805,41 @@ const App = () => {
       );
       if (!pending.length) return;
 
-      const ok = await ensureFreshToken();
-      if (!ok) return;
-      if (!stopped) setCalConnected(true);
+      retryInProgressRef.current = true;
+      try {
+        const ok = await ensureFreshToken();
+        if (!ok) return;
+        if (!stopped) setCalConnected(true);
 
-      let synced = 0;
-      let finalTasks = [...currentTasks];
-      for (const t of pending) {
-        const evId = await createCalEvent(t);
-        if (evId) {
-          synced++;
-          finalTasks = finalTasks.map(x =>
-            x.id === t.id ? { ...x, calendarEventId: evId, pendingCalendarSync: false } : x
-          );
+        let synced = 0;
+        // Re-read tasks each iteration so we never re-sync something just completed
+        for (const t of pending) {
+          // Re-check the task's current state — skip if it now has an eventId
+          const fresh = JSON.parse(localStorage.getItem('grind_tasks') || '{"tasks":[]}').tasks || [];
+          const cur = fresh.find(x => x.id === t.id);
+          if (!cur || cur.calendarEventId || !cur.pendingCalendarSync) continue;
+
+          const evId = await createCalEvent(cur);
+          if (evId) {
+            synced++;
+            // Re-read again before write so concurrent updates don't get clobbered
+            const latest = JSON.parse(localStorage.getItem('grind_tasks') || '{"tasks":[]}').tasks || [];
+            const patched = latest.map(x =>
+              x.id === t.id ? { ...x, calendarEventId: evId, pendingCalendarSync: false } : x
+            );
+            setTasks(patched);
+            await save('tasks', { tasks: patched });
+          }
         }
-      }
-      if (synced > 0 && !stopped) {
-        setTasks(finalTasks);
-        await save('tasks', { tasks: finalTasks });
-        showToast(`${synced} task${synced > 1 ? 's' : ''} synced to calendar 📅`, 'success', '☁️');
+        if (synced > 0 && !stopped) {
+          showToast(`${synced} task${synced > 1 ? 's' : ''} synced to calendar 📅`, 'success', '☁️');
+        }
+      } finally {
+        retryInProgressRef.current = false;
       }
     };
-    // Try shortly after mount, then every 90s
     const initial = setTimeout(retryPending, 6000);
     const id = setInterval(retryPending, 90000);
-    // Also try when the tab regains focus (user returning to app)
     const onFocus = () => retryPending();
     window.addEventListener('focus', onFocus);
     return () => {
@@ -2553,6 +2929,16 @@ const App = () => {
   const handleSaveTask = useCallback(async (task, repeat = 'none') => {
     const isNew = !editingTask;
 
+    // Read FRESH state from localStorage to avoid stale closures when saving rapidly
+    const readRecurring = () => {
+      try { return JSON.parse(localStorage.getItem('grind_recurring') || '{"recurring":[]}').recurring || []; }
+      catch(e) { return []; }
+    };
+    const readTasks = () => {
+      try { return JSON.parse(localStorage.getItem('grind_tasks') || '{"tasks":[]}').tasks || []; }
+      catch(e) { return []; }
+    };
+
     // If user selected a repeat pattern on a new task, create a recurring template
     if (isNew && repeat && repeat !== 'none') {
       const startDate = new Date(task.scheduledStart);
@@ -2571,16 +2957,17 @@ const App = () => {
         active: true,
         createdAt: new Date().toISOString()
       };
-      const newRecurring = [...recurringTasks, tmpl];
+      const currentRecurring = readRecurring();
+      const newRecurring = [...currentRecurring, tmpl];
       setRecurringTasks(newRecurring);
       await save('recurring', { recurring: newRecurring });
       task = { ...task, parentRecurringId: tmpl.id };
       showToast(`Repeat saved · ${describeRecurrence(tmpl)}`, 'success', '🔁');
     }
 
-    // Mark as pending calendar sync if sync is on; cleared when sync succeeds
-    const taskWithFlag = settings.calendarSync && isNew ? { ...task, pendingCalendarSync: true } : task;
-    const newTasks = isNew ? [...tasks, taskWithFlag] : tasks.map(t => t.id === task.id ? task : t);
+    // Read fresh tasks too (in case background generation / pull just ran)
+    const currentTasks = readTasks();
+    const newTasks = isNew ? [...currentTasks, task] : currentTasks.map(t => t.id === task.id ? task : t);
     setTasks(newTasks);
     setShowTaskModal(false);
     setEditingTask(null);
@@ -2591,33 +2978,35 @@ const App = () => {
       return;
     }
 
-    // Try silent refresh if token is stale
-    const ok = await ensureFreshToken();
-    if (ok) setCalConnected(true);
-
-    if (!ok) {
-      // No token, can't sync now — leave the pending flag, retry loop will catch up
-      showToast(isNew ? 'Task saved · will sync to calendar when online ⏳' : 'Task updated locally · sync pending', 'info', '⏳');
-      return;
-    }
+    // Try calendar sync inline (only place that does it for user-created tasks).
+    // We do NOT pre-mark pendingCalendarSync — only mark on actual failure, so the
+    // background retry loop won't race with this inline call.
+    const tokenOk = await ensureFreshToken();
+    if (tokenOk) setCalConnected(true);
 
     if (isNew && !task.calendarEventId) {
-      const evId = await createCalEvent(task);
-      if (evId) {
-        const finalTasks = newTasks.map(t => t.id === task.id ? { ...t, calendarEventId: evId, pendingCalendarSync: false } : t);
-        setTasks(finalTasks);
-        await save('tasks', { tasks: finalTasks });
-        showToast('Task saved · added to calendar 📅', 'success', '✅');
-      } else {
-        showToast('Task saved · will retry calendar sync ⏳', 'info', '⏳');
-      }
+      const evId = tokenOk ? await createCalEvent(task) : null;
+      const updated = newTasks.map(t =>
+        t.id === task.id
+          ? (evId
+              ? { ...t, calendarEventId: evId, pendingCalendarSync: false }
+              : { ...t, pendingCalendarSync: true })
+          : t
+      );
+      setTasks(updated);
+      await save('tasks', { tasks: updated });
+      showToast(
+        evId ? 'Task saved · added to calendar 📅' : 'Task saved · will sync when online ⏳',
+        evId ? 'success' : 'info',
+        evId ? '✅' : '⏳'
+      );
     } else if (!isNew && task.calendarEventId) {
-      const updateOk = await updateCalEvent(task.calendarEventId, task);
+      const updateOk = tokenOk ? await updateCalEvent(task.calendarEventId, task) : false;
       showToast(updateOk ? 'Task updated · calendar updated 📅' : 'Task updated · calendar sync pending', updateOk ? 'success' : 'info', updateOk ? '✅' : '⏳');
     } else {
       showToast(isNew ? 'Task created' : 'Task updated', 'success', '📋');
     }
-  }, [tasks, recurringTasks, editingTask, settings.calendarSync, showToast]);
+  }, [editingTask, settings.calendarSync, showToast]);
 
   const handleStartTask = useCallback(async (id) => {
     const newTasks = tasks.map(t => t.id === id ? { ...t, status: 'in_progress' } : t);
@@ -2970,7 +3359,7 @@ const App = () => {
   }, [showToast, scheduleDriveSync]);
 
   if (loading) return <LoadingScreen message={loadingMsg} />;
-  if (showWelcome) return <WelcomeScreen onStart={handleWelcomeStart} onRestore={handleRestoreFromCloud} />;
+  if (showWelcome) return <WelcomeScreen onStart={handleWelcomeStart} onRestore={handleRestoreFromCloud} onSignIn={handleSignIn} signingIn={signingIn} />;
   if (!profile) return <LoadingScreen />;
 
   const pendingCount = tasks.filter(t => t.status === 'pending' && isToday(t.scheduledStart)).length;
@@ -2987,7 +3376,7 @@ const App = () => {
           {view === 'inventory' && <InventoryView inventory={inventory} onUseItem={handleUseItem} onRedeemReward={handleRedeemReward} />}
           {view === 'story' && <StoryView profile={profile} />}
           {view === 'analytics' && <AnalyticsView profile={profile} tasks={tasks} />}
-          {view === 'settings' && <SettingsView settings={settings} profile={profile} onSaveSettings={handleSaveSettings} onResetProfile={handleResetProfile} onUpdateName={handleUpdateName} calendarConnected={calConnected} onCalendarConnect={handleCalendarConnect} onCalendarDisconnect={handleCalendarDisconnect} />}
+          {view === 'settings' && <SettingsView settings={settings} profile={profile} onSaveSettings={handleSaveSettings} onResetProfile={handleResetProfile} onUpdateName={handleUpdateName} calendarConnected={calConnected} onCalendarConnect={handleCalendarConnect} onCalendarDisconnect={handleCalendarDisconnect} sbUser={sbUser} onSignIn={handleSignIn} onSignOut={handleSignOut} signingIn={signingIn} />}
         </main>
       </div>
 
